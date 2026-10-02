@@ -13,6 +13,7 @@ import json
 import logging
 import time
 from contextlib import suppress
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
@@ -962,6 +963,8 @@ class GatewayNotificationsMixin:
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
             )
+            from gateway.process_completion import bind_process_completion_event
+            bind_process_completion_event(synth_event, evt, synth_text)
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
                 platform_name, source.chat_id, source.thread_id,
@@ -1219,7 +1222,7 @@ class GatewayNotificationsMixin:
         return tuple(str(evt.get(field) or "") for field in fields)
 
     @staticmethod
-    def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
+    def _format_coalesced_process_completions(entries: Sequence[tuple[str, dict, Optional[asyncio.Future]]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         from gateway.run import _redact_gateway_user_facing_secrets
         lines = [
@@ -1273,6 +1276,12 @@ class GatewayNotificationsMixin:
             # sibling is never discarded with it.
             delivered = None
             for _text, candidate_evt, _future in entries:
+                # Retain every producer identity through adapter admission: a
+                # foreground wait/log/poll may happen AFTER this batch is queued.
+                candidate_evt = dict(candidate_evt)
+                candidate_evt["_process_completion_entries"] = tuple(
+                    (evt, text) for text, evt, _future in entries
+                )
                 delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
                 if delivered is not None:
                     break

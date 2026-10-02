@@ -354,6 +354,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+    _poll_observer_session_key: str = field(default="", repr=False)  # transient, exact caller/incarnation
 
     def append_output(self, text: str) -> None:
         """Append to the rolling output buffer under the session lock, keeping the tail."""
@@ -1226,6 +1227,27 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    def has_observed_successful_completion(self, session_id: str, session_key: str, started_at) -> bool:
+        """Whether this owning gateway session polled this exact successful exit.
+
+        This is an observation, NOT a wait/log consumption receipt. Watchers keep
+        delivering it until the gateway can absorb it after a completed turn.
+        Failed/killed/lost and unknown process incarnations are never elided.
+        """
+        if not session_key or started_at is None:
+            return False
+        with self._lock:
+            process = self._finished.get(session_id) or self._running.get(session_id)
+        if process is None:
+            return False
+        with process._lock:
+            return bool(
+                process is not None and process.exited
+                and process.session_key == session_key and process.started_at == started_at
+                and process.exit_code == 0 and process.completion_reason in {"exited", "already_exited"}
+                and process._poll_observer_session_key == session_key
+            )
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
         this session: still running AND, with ``watch_patterns``, none matched yet (a
@@ -1500,7 +1522,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _status_head(session: ProcessSession) -> dict:
         return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
 
-    def poll(self, session_id: str) -> dict:
+    def poll(self, session_id: str, *, observer_session_key: str = "") -> dict:
         """Check status and get new output for a background process."""
         session = self.get(session_id)
         if session is None:
@@ -1517,6 +1539,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # _completion_consumed, or a status check would suppress the watcher's
             # autonomous delivery turn. See __init__.
             self._poll_observed.add(session_id)
+            # Only the tool dispatch boundary supplies this caller receipt.
+            # A watcher/status reader (or another session) must not absorb the
+            # owning session's autonomous completion. Kept on the process
+            # object so a recovered/reused id cannot inherit old provenance.
+            if observer_session_key and observer_session_key == session.session_key:
+                with session._lock:
+                    session._poll_observer_session_key = observer_session_key
         if session.detached:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -2049,8 +2078,13 @@ def _list_processes(task_id) -> dict:
 
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
 # actions are redacted; stdin actions return only status.
+def _poll_process(session_id: str, _args: dict) -> dict:
+    from tools.approval_context import get_bound_session_key
+    return process_registry.poll(session_id, observer_session_key=get_bound_session_key())
+
+
 _SESSION_ACTIONS = {
-    "poll": (lambda sid, a: process_registry.poll(sid), True),
+    "poll": (_poll_process, True),
     "log": (lambda sid, a: process_registry.read_log(sid, offset=a.get("offset"), limit=a.get("limit", 200)), True),
     "wait": (lambda sid, a: process_registry.wait(sid, timeout=a.get("timeout")), True),
     "kill": (lambda sid, a: process_registry.kill_process(sid), True),

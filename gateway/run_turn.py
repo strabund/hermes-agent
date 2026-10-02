@@ -1713,6 +1713,8 @@ class GatewayTurnMixin:
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
+        if agent_result.get("_suppress_discord_reply_reference"):
+            event._gateway_suppress_reply_reference = True
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
@@ -3296,6 +3298,14 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            from gateway.process_completion import refresh_process_completion_event
+            while pending_event and not refresh_process_completion_event(
+                pending_event, session_key=session_key, previous_result=result,
+            ):
+                logger.debug("Absorbing handled completion for session %s", session_key)
+                pending_event = self._promote_queued_event(
+                    session_key, adapter, _dequeue_pending_event(adapter, session_key),
+                )
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
@@ -3458,6 +3468,11 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                from gateway.process_completion import is_process_completion_event
+                if is_process_completion_event(pending_event):
+                    # Receipt may arrive while the original final is being sent.
+                    # Do not return that final to the outer adapter AGAIN.
+                    return dict(result, final_response="")
                 return result
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
@@ -3498,6 +3513,14 @@ class GatewayTurnMixin:
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
             message_type=next_message_type,
         )
+        from gateway.process_completion import completion_reply_has_no_reference
+        if isinstance(followup_result, dict):
+            # The recursive turn returns through the ORIGINAL inbound event.
+            # Carry only this final turn's routing decision out to that adapter
+            # boundary; do not inherit it across a later human follow-up.
+            followup_result.setdefault(
+                "_suppress_discord_reply_reference", completion_reply_has_no_reference(pending_event),
+            )
         return _preserve_queued_followup_history_offset(result, followup_result)
 
     async def _run_agent_cleanup_turn_tasks(
