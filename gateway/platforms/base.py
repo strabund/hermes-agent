@@ -142,7 +142,8 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics."""
     from gateway.process_completion import completion_reply_has_no_reference
-    if getattr(event, "_gateway_suppress_reply_reference", False) or completion_reply_has_no_reference(event):
+    suppress_reference = getattr(event, "_gateway_suppress_reply_reference", None)
+    if suppress_reference is True or (suppress_reference is None and completion_reply_has_no_reference(event)):
         return None
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))

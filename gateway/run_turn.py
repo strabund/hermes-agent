@@ -1355,7 +1355,10 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
-        _intentional_silence = self._is_intentional_silence(agent_result, response)
+        _intentional_silence = (
+            bool(agent_result.get("_absorbed_process_completion"))
+            or self._is_intentional_silence(agent_result, response)
+        )
 
         # "(empty)" = the model produced no visible content after exhausting all retries.
         if response == "(empty)" and not _intentional_silence:
@@ -1713,8 +1716,8 @@ class GatewayTurnMixin:
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
-        if agent_result.get("_suppress_discord_reply_reference"):
-            event._gateway_suppress_reply_reference = True
+        if "_suppress_discord_reply_reference" in agent_result:
+            event._gateway_suppress_reply_reference = bool(agent_result["_suppress_discord_reply_reference"])
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
@@ -3472,7 +3475,7 @@ class GatewayTurnMixin:
                 if is_process_completion_event(pending_event):
                     # Receipt may arrive while the original final is being sent.
                     # Do not return that final to the outer adapter AGAIN.
-                    return dict(result, final_response="")
+                    return dict(result, final_response="", _absorbed_process_completion=True)
                 return result
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)

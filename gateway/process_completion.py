@@ -8,6 +8,7 @@ receipt identities or suppress a real user message.
 from __future__ import annotations
 
 from gateway.config import Platform
+from gateway.platforms.event import MessageType
 from tools.process_registry_notifications import ProcessNotificationBatch
 
 _SILENCE_GUIDANCE = (
@@ -33,6 +34,8 @@ def is_process_completion_event(event) -> bool:
     # A merged human message must never be discarded or have its reply anchor changed.
     return bool(
         getattr(event, "internal", False)
+        and getattr(event, "message_type", None) == MessageType.TEXT
+        and not any(getattr(event, name, None) for name in ("media_urls", "media_types", "media_text_inlined"))
         and getattr(event, "_gateway_process_completion_batch", None)
         and event.text == getattr(event, "_gateway_process_completion_text", None)
     )
@@ -67,7 +70,8 @@ def refresh_process_completion_event(event, *, session_key: str = "", previous_r
     final = result.get("final_response") or ""
     finalized = bool(final.strip() and not is_intentional_silence_agent_result(result, final)
                      and not result.get("failed") and not result.get("interrupted")
-                     and not result.get("error"))
+                     and not result.get("error") and not result.get("partial")
+                     and result.get("completed") is not False)
     kept = []
     for evt, text in event._gateway_process_completion_batch.notifications:
         sid = str(evt.get("session_id") or "")

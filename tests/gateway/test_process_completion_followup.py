@@ -78,6 +78,9 @@ def setup_runner(monkeypatch, tmp_path):
     ("stale-epoch", 0, {"final_response": "Task completed"}, True),
     ("killed", 0, {"final_response": "Task completed"}, True),
     ("unbound-poll", 0, {"final_response": "Task completed"}, True),
+    ("poll", 0, {"final_response": "Partial", "partial": True}, True),
+    ("poll", 0, {"final_response": "Not complete", "completed": False}, True),
+    ("media-log", 0, {"final_response": "Task completed"}, True),
 ])
 async def test_queued_completion_rechecks_inline_result_without_losing_unread_results(
     monkeypatch, tmp_path, receipt, exit_code, previous_result, keep, delivery,
@@ -146,7 +149,15 @@ async def test_queued_completion_rechecks_inline_result_without_losing_unread_re
         pending.text += "\nA real new user request must survive"
     if receipt == "wait":
         assert registry.wait(session.id, timeout=1)["status"] == "exited"
-    if receipt == "log":
+    if receipt == "media-log":
+        from gateway.platforms.base import merge_pending_message_event
+        human_photo = MessageEvent(text="", source=source, message_type=MessageType.PHOTO,
+            media_urls=["human-image.png"], media_types=["image/png"], message_id="human-photo")
+        merge_pending_message_event(adapter._pending_messages, key, human_photo)
+        pending = adapter._pending_messages[key]
+        assert pending.media_urls == ["human-image.png"]
+        runner._enrich_inbound_images = AsyncMock(side_effect=lambda _source, _key, text, _paths: text)
+    if receipt in {"log", "media-log"}:
         registry.read_log(session.id)
     expected_drop = not keep
     if delivery == "idle":
@@ -173,6 +184,8 @@ async def test_queued_completion_rechecks_inline_result_without_losing_unread_re
             assert "completion-result" not in text
     assert (event is not None) == keep
     assert bool(text) == keep
+    if receipt == "media-log":
+        assert event is not None and event.media_urls == ["human-image.png"]
     if keep:
         assert text is not None
         if not (delivery == "mixed" and expected_drop):
@@ -184,8 +197,9 @@ async def test_queued_completion_rechecks_inline_result_without_losing_unread_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("outer_kind", ["human", "completion"])
 @pytest.mark.parametrize("next_turn", ["completion", "late-log", "nested-human", "nested-completion"])
-async def test_discord_completion_final_does_not_quote_original_task(monkeypatch, tmp_path, queued, next_turn):
+async def test_discord_completion_final_does_not_quote_original_task(monkeypatch, tmp_path, queued, next_turn, outer_kind):
     runner, adapter, registry, source, key = setup_runner(monkeypatch, tmp_path)
     session = ProcessSession(id="proc-unread", command="probe", session_key=key, started_at=time.time(),
                              exited=True, exit_code=7, output_buffer="new failure")
@@ -206,7 +220,11 @@ async def test_discord_completion_final_does_not_quote_original_task(monkeypatch
     if queued:
         runner._run_agent_deliver_first_response = AsyncMock()
         if next_turn == "late-log":
-            runner._run_agent_deliver_first_response.side_effect = lambda *args: registry.read_log(session.id)
+            async def deliver_then_consume(*args):
+                await runner._deliver_queued_first_response(
+                    "Original final", source, adapter, metadata={"thread_id": "thread"}, deliver_media=False)
+                registry.read_log(session.id)
+            runner._run_agent_deliver_first_response.side_effect = deliver_then_consume
         elif next_turn.startswith("nested-"):
             result["_suppress_discord_reply_reference"] = next_turn == "nested-completion"
         runner._refresh_agent_cache_message_count = AsyncMock()
@@ -219,13 +237,27 @@ async def test_discord_completion_final_does_not_quote_original_task(monkeypatch
         if next_turn == "late-log":
             runner._run_agent.assert_not_called()
             assert result["final_response"] == ""
+            response, silent, messages = await runner._hmwa_shape_agent_response(
+                dict(result, api_calls=1), source, [], runner.session_store.get_or_create_session(source),
+                key, key, 1, "sid", "discord", time.time())
+            assert silent and not response
+            delivery = await runner._hmwa_deliver_turn_response(
+                outer, source, SimpleNamespace(session_id="sid"), key, 1, result, messages, response, "", silent)
+            adapter._active_sessions.pop(key, None)
+            adapter.set_message_handler(AsyncMock(return_value=delivery))
+            await adapter._process_message_background(outer, key)
+            assert adapter.sent == [("thread", "Original final", None, {"thread_id": "thread"})]
             return
     delivery_event = outer if queued else wake
+    if queued and outer_kind == "completion":
+        delivery_event = wake
+    if queued and next_turn == "nested-human":
+        delivery_event._gateway_suppress_reply_reference = True
     runner._should_send_voice_reply = lambda *a, **k: False
     response = await runner._hmwa_deliver_turn_response(delivery_event, source,
         SimpleNamespace(session_id="sid"), key, 1, result, [], "New failure", "", False)
     adapter._active_sessions.pop(key, None)
     adapter.set_message_handler(AsyncMock(return_value=response))
     await adapter._process_message_background(delivery_event, key)
-    expected_anchor = "original-user" if queued and next_turn == "nested-human" else None
+    expected_anchor = delivery_event.message_id if queued and next_turn == "nested-human" else None
     assert adapter.sent == [("thread", "New failure", expected_anchor, {"thread_id": "thread", "notify": True})]
